@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII Mouth → Heart</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #06040a; overflow: hidden;
+    font-family: ui-monospace, "JetBrains Mono", "Fira Code", Menlo, Consolas, "Courier New", monospace; color: #9a8fa3; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; touch-action: none; }
+  #hud { position: fixed; left: 14px; bottom: 12px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    opacity: .7; pointer-events: none; user-select: none; }
+  #hud b { color: #ff5c7a; font-weight: 600; }
+  #hud span { opacity: .55; }
+  #bar { position: fixed; left: 0; bottom: 0; height: 2px; background: #ff5c7a; width: 0; opacity: .55; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><b id="phase">forming</b> <span>· click to replay · space to pause · 1–4 jump</span></div>
+<div id="bar"></div>
+<script>
+(() => {
+'use strict';
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false });
+const phaseEl = document.getElementById('phase');
+const bar = document.getElementById('bar');
+
+const RAMP = ' .:-=+*#%@';
+const NR = RAMP.length - 1;
+const FONT = 'ui-monospace, "JetBrains Mono", "Fira Code", Menlo, Consolas, "Courier New", monospace';
+
+// timeline (seconds)
+const T_FORM = 3.2, T_OPEN0 = 3.4, T_OPEN1 = 5.4, T_DIVE0 = 5.2, T_DIVE1 = 8.4,
+      T_HEART0 = 7.8, T_HEART1 = 9.8, T_DISS0 = 13.8, T_DISS1 = 15.7, T_LOOP = 16.0;
+
+const clamp01 = x => x < 0 ? 0 : x > 1 ? 1 : x;
+const smooth = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+
+// ---------- noise ----------
+function hash2(x, y) {
+  let n = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)) | 0;
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  n ^= n >>> 16;
+  return (n >>> 0) / 4294967296;
+}
+function vnoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi), b = hash2(xi + 1, yi), c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x, y) {
+  return 0.6 * vnoise(x, y) + 0.3 * vnoise(x * 2.1 + 5.2, y * 2.1 + 1.3) + 0.1 * vnoise(x * 4.3 + 9.1, y * 4.3 + 7.7);
+}
+
+// ---------- palettes (12 luminance steps each) ----------
+function lerp3(a, b, t) { return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]; }
+function pal(dark, mid, hi) {
+  const o = [];
+  for (let i = 0; i < 12; i++) {
+    const t = i / 11;
+    const c = t < 0.65 ? lerp3(dark, mid, t / 0.65) : lerp3(mid, hi, (t - 0.65) / 0.35);
+    o.push(`rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`);
+  }
+  return o;
+}
+const PALS = [
+  pal([38, 34, 48], [118, 110, 134], [196, 188, 210]),   // 0 dust / noise
+  pal([72, 6, 26], [216, 38, 78], [255, 150, 170]),      // 1 lips
+  pal([110, 100, 88], [226, 218, 198], [255, 251, 240]), // 2 teeth
+  pal([92, 20, 42], [202, 72, 104], [242, 136, 156]),    // 3 tongue
+  pal([28, 8, 22], [112, 26, 58], [176, 66, 100]),       // 4 cavity / tunnel
+  pal([112, 0, 30], [242, 42, 84], [255, 186, 200]),     // 5 heart
+  pal([210, 130, 150], [255, 222, 232], [255, 255, 255]), // 6 letter on the heart
+];
+
+// ---------- the letter written on the heart (rasterised once, in heart space) ----------
+const LETTER = 'S';
+const LM = 256, LX0 = -1.4, LX1 = 1.4, LY0 = -0.3, LY1 = 1.5;
+let letterMask = null;
+function buildLetter() {
+  try {
+    const c = document.createElement('canvas'); c.width = LM; c.height = LM;
+    const g = c.getContext('2d');
+    g.fillStyle = '#000'; g.fillRect(0, 0, LM, LM);
+    const fsz = 100;
+    g.fillStyle = '#fff'; g.font = 'bold ' + fsz + 'px Arial, Helvetica, "Liberation Sans", sans-serif';
+    g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+    const cx = (0 - LX0) / (LX1 - LX0) * LM, cy = (LY1 - 0.56) / (LY1 - LY0) * LM;
+    g.fillText(LETTER, cx, cy + 0.358 * fsz);
+    letterMask = g.getImageData(0, 0, LM, LM).data;
+  } catch (e) { letterMask = null; }
+}
+function letterAt(x, y) {
+  if (!letterMask) return 0;
+  const i = ((x - LX0) / (LX1 - LX0) * LM) | 0, j = ((LY1 - y) / (LY1 - LY0) * LM) | 0;
+  if (i < 0 || j < 0 || i >= LM || j >= LM) return 0;
+  return letterMask[(j * LM + i) * 4] > 127 ? 1 : 0;
+}
+
+// ---------- scene pieces ----------
+let oD = 0, oP = 0, oL = 0; // density, palette, luminance written by mouthAt
+
+// x,y in scene units (screen height = 2, y up). a = aperture 0..1
+function mouthAt(x, y, a) {
+  const W = 1.0;
+  const ax = Math.abs(x);
+  if (ax >= W) return false;
+  const q = 1 - (x * x) / (W * W);
+  // outer shape: cupid's bow with two peaks and a notch, tapered corners, full lower lip
+  const bow = Math.exp(-((ax - 0.36) * (ax - 0.36)) / 0.06);
+  const notch = Math.exp(-(x * x) / 0.02);
+  const up = Math.pow(q, 0.8) * 0.22 + q * 0.05 * bow - 0.035 * notch + a * 0.12 * q;
+  const lo = -(Math.pow(q, 0.85) * 0.30 + 0.04 * Math.exp(-(x * x) / 0.12)) - a * 0.16 * Math.pow(q, 0.8);
+  if (y > up || y < lo) return false;
+  const Wi = 0.84 * W;
+  const qi = Math.max(0, 1 - (x * x) / (Wi * Wi));
+  const qip = Math.pow(qi, 0.8);
+  const seam = 0.01 - 0.035 * q;
+  const iu = seam + a * 0.16 * qip;
+  const il = seam - a * 0.22 * qip;
+  // the dark line where closed lips meet
+  const seamW = 0.024 * (1 - Math.min(1, a / 0.3));
+  if (seamW > 0 && Math.abs(y - seam) < seamW) { oD = 0.08; oP = 4; oL = 0.1; return true; }
+  const wrinkle = 0.5 + 0.5 * Math.sin(x * 48 + y * 6);
+  const corner = 1 - 0.45 * smooth(0.72, 1.0, ax);
+  if (y >= iu) { // upper lip: in shadow, bright vermilion border on top
+    const th = up - iu, f = th > 1e-4 ? (y - iu) / th : 0;
+    if (up - y < 0.028) { oD = 0.55; oP = 1; oL = 0.95 * corner; return true; }
+    const shade = Math.sin(f * Math.PI);
+    oD = 0.45 + 0.55 * shade - 0.18 * wrinkle * (1 - 0.5 * shade); oP = 1; oL = (0.28 + 0.5 * shade) * corner;
+    return true;
+  }
+  if (y <= il) { // lower lip: lit, with a glint, shadow underneath
+    const th = il - lo, f = th > 1e-4 ? (il - y) / th : 0;
+    if (y - lo < 0.028) { oD = 0.35; oP = 1; oL = 0.18; return true; }
+    const shade = Math.sin(f * Math.PI);
+    const glint = Math.exp(-(x * x) / 0.1) * Math.exp(-((f - 0.4) * (f - 0.4)) / 0.04);
+    oD = 0.45 + 0.55 * shade - 0.18 * wrinkle * (1 - 0.5 * shade); oP = 1; oL = (0.4 + 0.55 * shade + 0.35 * glint) * corner;
+    return true;
+  }
+  // inside the open mouth: only a dim hint of teeth in the shadow of the upper lip
+  const gap = iu - il;
+  const tw = 0.13;
+  if (ax < 0.5 * W) {
+    const tH = Math.min(0.045, gap * 0.25);
+    if (y > iu - tH) {
+      const fr = ((x + 10 * tw) / tw) % 1;
+      const edge = Math.min(fr, 1 - fr);
+      const depth = (iu - y) / tH;
+      if (edge < 0.12) { oD = 0.08; oP = 4; oL = 0.1; return true; }
+      oD = 0.4 + 0.2 * (1 - depth); oP = 2; oL = 0.28 + 0.2 * (1 - depth);
+      return true;
+    }
+  }
+  // tongue
+  const ty = il + 0.06 * a;
+  const tx = x / (0.55 * W), tyy = (y - ty) / (0.1 * a + 1e-3);
+  const tr = tx * tx + tyy * tyy;
+  if (tr < 1 && y > il) { oD = 0.35 + 0.25 * (1 - tr); oP = 3; oL = 0.4 + 0.5 * (1 - tr); return true; }
+  // dark cavity
+  oD = 0; oP = 4; oL = 0;
+  return true;
+}
+
+let hX = 0, hY = 0, hF = 1;
+// signed distance to a heart: tip at (0,0), lobes up to y≈1.15, width ±1 (negative inside)
+function sdHeart(px, py) {
+  const x = Math.abs(px), y = py;
+  if (y + x > 1) { const dx = x - 0.25, dy = y - 0.75; return Math.sqrt(dx * dx + dy * dy) - 0.3535533906; }
+  const d1y = y - 1, d1 = x * x + d1y * d1y;
+  const m = 0.5 * Math.max(x + y, 0), d2x = x - m, d2y = y - m, d2 = d2x * d2x + d2y * d2y;
+  return Math.sqrt(Math.min(d1, d2)) * Math.sign(x - y);
+}
+// k = heart scale in scene units. returns -1 outside, else 0 (edge) .. 1 (deep inside)
+function heartAt(u, v, k) {
+  const x = u / k, y = v / k + 0.55;
+  hX = x; hY = y;
+  const d = sdHeart(x, y);
+  hF = d;
+  if (d >= 0) return -1;
+  return Math.min(1, -d / 0.14);
+}
+
+function beatFn(t) {
+  const period = 0.9, p = (t % period) / period;
+  const a = (p - 0.08) / 0.07, b = (p - 0.3) / 0.09;
+  return Math.exp(-a * a) + 0.6 * Math.exp(-b * b);
+}
+
+// ---------- state ----------
+let W, H, dpr, fs, cw, ch, cols, rows, ar, ms, seeds, seedBase = 1;
+let t = 0, last = performance.now(), paused = false, mx = 0, my = 0, lastPhase = '';
+
+function reseed() {
+  seedBase = (Math.random() * 1e9) | 0;
+  for (let i = 0; i < seeds.length; i++) seeds[i] = hash2(i * 7 + seedBase, (i * 13) ^ seedBase);
+}
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  fs = Math.max(10, Math.min(22, Math.round(Math.min(W / 88, H / 42))));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.font = fs + 'px ' + FONT;
+  ctx.textBaseline = 'top';
+  cw = ctx.measureText('M').width || fs * 0.6;
+  ch = fs;
+  cols = Math.ceil(W / cw); rows = Math.ceil(H / ch);
+  ar = W / H;
+  ms = Math.min(1.6, ar / 1.05);
+  seeds = new Float32Array(cols * rows);
+  reseed();
+}
+
+// ---------- render ----------
+function render(t) {
+  const form = clamp01(t / T_FORM);
+  const a = smooth(T_OPEN0, T_OPEN1, t);
+  const dive = smooth(T_DIVE0, T_DIVE1, t);
+  const s = Math.exp(dive * 3.8);
+  const heartIn = smooth(T_HEART0, T_HEART1, t);
+  const diss = smooth(T_DISS0, T_DISS1, t);
+  const beat = beatFn(t);
+  const hs = (0.25 + 0.75 * heartIn) * (1 + 0.075 * beat);
+  const kH = Math.min(1.0, ar * 0.9) * hs;
+  const write = smooth(T_HEART1 + 0.2, T_HEART1 + 1.6, t);
+  const ringAmt = smooth(2.5, 9, s) * (1 - 0.4 * heartIn) * (1 - diss);
+  const cy = 0.0;
+  const ox = mx * 0.05 * (1 - dive), oy = -my * 0.03 * (1 - dive);
+  const hpx = -mx * 0.03, hpy = my * 0.02;
+  const flick = Math.floor(t * 14);
+
+  ctx.fillStyle = '#06040a';
+  ctx.fillRect(0, 0, W, H);
+
+  if (heartIn > 0 && diss < 1) {
+    const gx = ((-hpx) / ar + 1) * 0.5 * W, gy = (1 - (-hpy)) * 0.5 * H;
+    const gr = Math.max(1, kH * 0.6 * H);
+    const g = ctx.createRadialGradient(gx, gy, 0, gx, gy, gr);
+    const al = (0.16 + 0.22 * beat) * heartIn * (1 - diss);
+    g.addColorStop(0, `rgba(255,40,80,${al.toFixed(3)})`);
+    g.addColorStop(0.6, `rgba(160,10,50,${(al * 0.35).toFixed(3)})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  let cur = null;
+  for (let j = 0; j < rows; j++) {
+    const v = 1 - (j + 0.5) / rows * 2;
+    const py = j * ch;
+    for (let i = 0; i < cols; i++) {
+      const u = ((i + 0.5) / cols * 2 - 1) * ar;
+      const sd = seeds[j * cols + i];
+      let d = 0, p = 0, l = 0;
+
+      // the mouth, seen through the zoom
+      const x = (u / s) / ms + ox, y = (cy + (v - cy) / s) / ms + oy;
+      const inside = mouthAt(x, y, a);
+      if (inside) { d = oD; p = oP; l = oL; }
+      else if (s < 1.5) { // ambient dust around the mouth
+        const n = fbm(u * 5 + t * 0.15, v * 5 - t * 0.1);
+        if (n > 0.71) { d = 0.1 + (n - 0.71) * 1.5; p = 0; l = 0.25; }
+      }
+
+      // the dark inside: tunnel rings once we dive
+      if (!inside || p === 4) {
+        const dv = v - cy, r = Math.sqrt(u * u + dv * dv);
+        if (ringAmt > 0) {
+          const ring = 0.5 + 0.5 * Math.sin(9 * Math.log(r + 0.03) - 4.5 * t + 2.5 * fbm(u * 1.3 + 3.1, v * 1.3 + 0.7));
+          const dd = ringAmt * ring * ring * ring * smooth(0.04, 0.7, r) * 0.6;
+          if (dd > d) { d = dd; p = 4; l = Math.min(1, 0.1 + dd * 1.7); }
+        } else if (inside) {
+          const n = fbm(u * 7 + t * 0.3, v * 7);
+          if (n > 0.6) { d = 0.11; p = 4; l = 0.2; }
+        }
+      }
+
+      // the heart
+      if (heartIn > 0) {
+        const inner = heartAt(u - hpx, v - hpy, kH);
+        if (inner >= 0) {
+          const dx = hX + 0.42, dy = hY - 0.85;
+          const hl = Math.exp(-(dx * dx + dy * dy) / 0.12);
+          const veins = fbm(hX * 2.2 + 0.1 * t, hY * 2.2 - 0.06 * t);
+          const settleH = smooth(sd * 0.6, sd * 0.6 + 0.4, heartIn);
+          d = clamp01(0.5 + 0.5 * inner - 0.14 * veins + 0.3 * hl) * (0.88 + 0.12 * beat) * settleH;
+          p = 5; l = clamp01(0.35 + 0.5 * inner - 0.15 * veins + 0.5 * hl + 0.12 * beat);
+          if (write > 0 && hY > 1.08 - 1.0 * write) { // the letter, written top to bottom
+            if (letterAt(hX, hY)) { d = 1; p = 6; l = 0.8 + 0.2 * beat; }
+            else {
+              const du = (2 * ar / cols) / kH, dv = (2 / rows) / kH;
+              if (letterAt(hX + du, hY) || letterAt(hX - du, hY) || letterAt(hX, hY + dv) || letterAt(hX, hY - dv)) { d = 0.1; l = 0.15; }
+            }
+          }
+        } else if (hF < 0.035 && heartIn > 0.6 && d < 0.14) { d = 0.14; p = 5; l = 0.3; }
+      }
+
+      // chaos: characters still swirling in at the start, scattering at the end
+      const settle = smooth(sd * 0.55, sd * 0.55 + 0.35, form);
+      const dissCell = smooth(sd * 0.5, sd * 0.5 + 0.5, diss);
+      const chaos = Math.max(1 - settle, dissCell);
+      if (chaos > 0) {
+        const sw = (1 - form) * 0.8;
+        const n = fbm(u * 2.4 + t * 0.7 * sw + Math.sin(v * 3 + t) * 0.2, v * 2.4 - t * 0.45);
+        let nd = clamp01((n - 0.32) * 1.7);
+        nd *= 0.55 + 0.45 * hash2(i * 3 + flick * 131, j * 5 + flick * 17);
+        d = d * (1 - chaos) + nd * chaos;
+        if (chaos > 0.5) { p = 0; l = 0.2 + 0.8 * nd; } else { l = l * (1 - chaos) + nd * chaos; }
+      }
+
+      const ci = Math.round(d * NR);
+      if (ci <= 0) continue;
+      const li = Math.round(clamp01(l) * 11);
+      const st = PALS[p][li];
+      if (st !== cur) { ctx.fillStyle = st; cur = st; }
+      ctx.fillText(RAMP[ci], i * cw, py);
+    }
+  }
+
+  const name = t < T_OPEN0 ? 'forming' : t < T_DIVE0 ? 'opening' : t < T_HEART0 ? 'diving in' : t < T_DISS0 ? 'heart' : 'dissolving';
+  if (name !== lastPhase) { phaseEl.textContent = name; lastPhase = name; }
+  bar.style.width = (t / T_LOOP * 100).toFixed(2) + '%';
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const now = performance.now();
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (!paused) t += dt;
+  if (t >= T_LOOP) { t -= T_LOOP; reseed(); }
+  render(t);
+}
+
+// ---------- input ----------
+window.addEventListener('resize', resize);
+window.addEventListener('pointermove', e => { mx = (e.clientX / W) * 2 - 1; my = (e.clientY / H) * 2 - 1; });
+window.addEventListener('pointerdown', () => { t = 0; reseed(); paused = false; });
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
+  else if (e.key >= '1' && e.key <= '4') { t = [0, T_OPEN0, T_DIVE0, T_HEART0][e.key - 1]; paused = false; }
+});
+
+buildLetter();
+resize();
+frame();
+window.asciiHeart = { render, get t() { return t; }, set t(v) { t = v; } };
+})();
+</script>
+</body>
+</html>
